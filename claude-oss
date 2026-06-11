@@ -1,0 +1,513 @@
+#!/usr/bin/env bash
+#
+# claude-oss — launch Claude Code against alternative model providers
+# (GLM, DeepSeek, Kimi, Ollama, or any Anthropic-compatible endpoint).
+#
+# Usage:
+#   claude-oss                      interactive picker (provider -> model -> mode)
+#   claude-oss <provider> [model]   launch directly
+#   claude-oss last                 relaunch last provider/model/mode
+#   claude-oss list                 list configured providers
+#   claude-oss add                  create a new provider
+#   claude-oss edit <provider>     edit a provider in $EDITOR
+#   claude-oss remove <provider>   delete a provider
+#   claude-oss -- <claude args>     extra args passed straight to claude
+#
+set -euo pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/claude-oss"
+PROVIDERS_DIR="$CONFIG_DIR/providers"
+LAST_FILE="$CONFIG_DIR/last"
+
+BOLD=$'\033[1m'; DIM=$'\033[2m'; CYAN=$'\033[36m'; GREEN=$'\033[32m'
+YELLOW=$'\033[33m'; RED=$'\033[31m'; RESET=$'\033[0m'
+
+ADD_PROVIDER_ITEM="+ Add new provider"
+ADD_MODEL_ITEM="+ Enter custom model id"
+
+die()  { printf '%s\n' "${RED}error:${RESET} $*" >&2; exit 1; }
+info() { printf '%s\n' "${CYAN}::${RESET} $*"; }
+
+# ---------------------------------------------------------------- presets ---
+
+seed_presets() {
+  mkdir -p "$PROVIDERS_DIR"
+  [ -n "$(ls -A "$PROVIDERS_DIR" 2>/dev/null)" ] && return 0
+  info "First run — seeding provider presets in $PROVIDERS_DIR"
+
+  cat > "$PROVIDERS_DIR/glm.conf" <<'EOF'
+NAME="Z.ai (GLM)"
+BASE_URL="https://api.z.ai/api/anthropic"
+AUTH_TOKEN=""
+AUTH_TOKEN_ENV="ZAI_API_KEY"
+MODELS="glm-5.1 glm-5.1-air glm-4.7 glm-4.7-air"
+DEFAULT_MODEL="glm-5.1"
+SMALL_FAST_MODEL="glm-4.7-air"
+EOF
+
+  cat > "$PROVIDERS_DIR/deepseek.conf" <<'EOF'
+NAME="DeepSeek"
+BASE_URL="https://api.deepseek.com/anthropic"
+AUTH_TOKEN=""
+AUTH_TOKEN_ENV="DEEPSEEK_API_KEY"
+MODELS="deepseek-v4-pro deepseek-v4-flash deepseek-chat deepseek-reasoner"
+DEFAULT_MODEL="deepseek-v4-pro"
+SMALL_FAST_MODEL="deepseek-v4-flash"
+EOF
+
+  cat > "$PROVIDERS_DIR/kimi.conf" <<'EOF'
+NAME="Moonshot (Kimi)"
+BASE_URL="https://api.moonshot.ai/anthropic"
+AUTH_TOKEN=""
+AUTH_TOKEN_ENV="MOONSHOT_API_KEY"
+MODELS="kimi-k2.6 kimi-k2-thinking kimi-latest"
+DEFAULT_MODEL="kimi-k2.6"
+SMALL_FAST_MODEL=""
+EOF
+
+  cat > "$PROVIDERS_DIR/ollama.conf" <<'EOF'
+NAME="Ollama (local)"
+BASE_URL="http://localhost:11434"
+AUTH_TOKEN="ollama"
+AUTH_TOKEN_ENV=""
+# Models are fetched live from /v1/models; these are fallbacks only.
+MODELS_CMD="ollama list 2>/dev/null | awk 'NR>1{print \$1}'"
+MODELS="qwen3-coder gpt-oss:20b"
+DEFAULT_MODEL=""
+SMALL_FAST_MODEL=""
+EOF
+
+  chmod 600 "$PROVIDERS_DIR"/*.conf
+}
+
+# ---------------------------------------------------------------- helpers ---
+
+providers() {
+  ls "$PROVIDERS_DIR" 2>/dev/null | sed -n 's/\.conf$//p'
+}
+
+load_provider() {
+  local file="$PROVIDERS_DIR/$1.conf"
+  [ -f "$file" ] || die "no such provider: $1 (try 'claude-oss list')"
+  NAME="" BASE_URL="" AUTH_TOKEN="" AUTH_TOKEN_ENV="" MODELS="" MODELS_CMD=""
+  DEFAULT_MODEL="" SMALL_FAST_MODEL="" EXTRA_ENV="" EXTRA_ARGS=""
+  # shellcheck disable=SC1090
+  source "$file"
+  [ -n "$BASE_URL" ] || die "provider '$1' has no BASE_URL set"
+}
+
+confirm() { # confirm "question" [default y|n]
+  local q="$1" def="${2:-n}" ans hint
+  [ "$def" = y ] && hint="Y/n" || hint="y/N"
+  printf '%s' "${BOLD}$q${RESET} ${DIM}[$hint]${RESET} " >&2
+  IFS= read -r ans
+  ans="${ans:-$def}"
+  [[ "$ans" =~ ^[Yy] ]]
+}
+
+ask() { # ask VAR "Prompt" [secret]
+  local _var="$1" _prompt="$2" _secret="${3:-}" _val
+  printf '%s' "${BOLD}${_prompt}${RESET}: " >&2
+  if [ -n "$_secret" ]; then
+    IFS= read -rs _val; printf '\n' >&2
+  else
+    IFS= read -r _val
+  fi
+  printf -v "$_var" '%s' "$_val"
+}
+
+# ----------------------------------------------------- interactive picker ---
+#
+# pick "Title" item...  -> sets PICK_CHOICE; returns 1 on Esc/cancel.
+# Arrow keys / PgUp / PgDn / Home / End to move, type to filter,
+# Enter to select, Esc to cancel. Set PICK_PRESELECT to preselect an item.
+# Falls back to a numbered stdin menu when no tty is available.
+
+pick() {
+  PICK_CHOICE=""
+  local title="$1"; shift
+  local all=("$@")
+  [ "${#all[@]}" -gt 0 ] || return 1
+
+  if ! { exec 3</dev/tty 4>/dev/tty; } 2>/dev/null; then
+    pick_numeric "$title" "${all[@]}"
+    return
+  fi
+
+  local term_rows term_cols size
+  size=$(stty size <&3 2>/dev/null || echo "24 80")
+  term_rows=${size%% *}; term_cols=${size##* }
+  [ "${term_rows:-0}" -ge 8 ] || term_rows=24
+  [ "${term_cols:-0}" -ge 30 ] || term_cols=80
+  local nrows=$(( term_rows - 6 ))
+  [ "$nrows" -gt 14 ] && nrows=14
+  [ "$nrows" -lt 3 ] && nrows=3
+  local maxw=$(( term_cols - 6 ))
+
+  local query="" sel=0 off=0 drawn=0 rc=0
+  if [ -n "${PICK_PRESELECT:-}" ]; then
+    local i
+    for i in "${!all[@]}"; do
+      if [ "${all[$i]}" = "$PICK_PRESELECT" ]; then sel=$i; break; fi
+    done
+    PICK_PRESELECT=""
+  fi
+
+  printf '\033[?25l' >&4
+
+  local filtered=() it lq n i shown out key rest status
+  while :; do
+    filtered=()
+    lq="${query,,}"
+    for it in "${all[@]}"; do
+      [[ -z "$query" || "${it,,}" == *"$lq"* ]] && filtered+=("$it")
+    done
+    n=${#filtered[@]}
+    [ "$sel" -ge "$n" ] && sel=$(( n > 0 ? n - 1 : 0 ))
+    [ "$sel" -lt 0 ] && sel=0
+    [ "$off" -gt "$sel" ] && off=$sel
+    [ "$sel" -ge $(( off + nrows )) ] && off=$(( sel - nrows + 1 ))
+    [ "$off" -lt 0 ] && off=0
+
+    [ "$drawn" -gt 0 ] && printf '\033[%dA' "$drawn" >&4
+    out="\r\033[K${BOLD}${title}${RESET} ${DIM}(type to filter · ↑↓ move · Enter select · Esc cancel)${RESET}\n"
+    out+="\r\033[K  ${CYAN}❯${RESET} ${query}${DIM}█${RESET}\n"
+    shown=0
+    for (( i = off; i < n && shown < nrows; i++, shown++ )); do
+      it="${filtered[$i]}"
+      [ "${#it}" -gt "$maxw" ] && it="${it:0:$(( maxw - 1 ))}…"
+      if [ "$i" -eq "$sel" ]; then
+        out+="\r\033[K \033[7m ${it} \033[27m\n"
+      else
+        out+="\r\033[K   ${it}\n"
+      fi
+    done
+    while [ "$shown" -lt "$nrows" ]; do out+="\r\033[K\n"; shown=$(( shown + 1 )); done
+    if [ "$n" -eq 0 ]; then status="no matches — Esc to cancel"; else status="$(( sel + 1 ))/$n"; fi
+    [ "$off" -gt 0 ] && status+="  ↑ more"
+    [ $(( off + nrows )) -lt "$n" ] && status+="  ↓ more"
+    out+="\r\033[K  ${DIM}${status}${RESET}"
+    printf '%b' "$out" >&4
+    drawn=$(( nrows + 2 ))
+
+    IFS= read -rsn1 -u3 key || { rc=1; break; }
+    if [ "$key" = $'\x1b' ]; then
+      rest=""
+      IFS= read -rsn2 -t 0.02 -u3 rest || true
+      case "$rest" in
+        '[A') sel=$(( sel - 1 )) ;;
+        '[B') sel=$(( sel + 1 )) ;;
+        '[5') IFS= read -rsn1 -t 0.02 -u3 _ || true; sel=$(( sel - nrows )) ;;
+        '[6') IFS= read -rsn1 -t 0.02 -u3 _ || true; sel=$(( sel + nrows )) ;;
+        '[H') sel=0 ;;
+        '[F') sel=$(( n - 1 )) ;;
+        '')   rc=1; break ;;
+      esac
+    elif [ -z "$key" ]; then            # Enter
+      if [ "$n" -gt 0 ]; then
+        PICK_CHOICE="${filtered[$sel]}"
+        break
+      fi
+    elif [ "$key" = $'\x7f' ] || [ "$key" = $'\x08' ]; then
+      query="${query%?}"
+    elif [ "$key" = $'\x03' ]; then     # Ctrl-C
+      printf '\033[%dA\r\033[J\033[?25h' "$drawn" >&4
+      exec 3<&- 4>&-
+      exit 130
+    elif [[ "$key" == [[:print:]] ]]; then
+      query+="$key"; sel=0; off=0
+    fi
+  done
+
+  printf '\033[%dA\r\033[J\033[?25h' "$drawn" >&4
+  exec 3<&- 4>&-
+  return "$rc"
+}
+
+pick_numeric() { # stdin fallback for non-tty use
+  PICK_CHOICE=""
+  local title="$1"; shift
+  local items=("$@") i choice
+  printf '\n%s\n' "${BOLD}$title${RESET}" >&2
+  for i in "${!items[@]}"; do
+    printf '  %s%2d)%s %s\n' "$GREEN" "$(( i + 1 ))" "$RESET" "${items[$i]}" >&2
+  done
+  while :; do
+    printf '%s' "${BOLD}> ${RESET}" >&2
+    IFS= read -r choice || return 1
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#items[@]}" ]; then
+      PICK_CHOICE="${items[$(( choice - 1 ))]}"
+      return 0
+    fi
+    for i in "${items[@]}"; do
+      if [ "$choice" = "$i" ] || [ "$choice" = "${i%% *}" ]; then
+        PICK_CHOICE="$i"
+        return 0
+      fi
+    done
+    printf '%s\n' "${YELLOW}pick 1-${#items[@]} or type a name${RESET}" >&2
+  done
+}
+
+# ------------------------------------------------------------------ models ---
+
+resolve_token() { # uses NAME/AUTH_TOKEN/AUTH_TOKEN_ENV; sets TOKEN
+  TOKEN="$AUTH_TOKEN"
+  if [ -z "$TOKEN" ] && [ -n "$AUTH_TOKEN_ENV" ]; then
+    TOKEN="${!AUTH_TOKEN_ENV:-}"
+  fi
+  if [ -z "$TOKEN" ]; then
+    ask TOKEN "API key for $NAME ${DIM}(input hidden)${RESET}" secret
+    [ -n "$TOKEN" ] || die "no API key provided"
+    if confirm "Save this key to $PROVIDERS_DIR/$PROVIDER.conf?" y; then
+      local file="$PROVIDERS_DIR/$PROVIDER.conf"
+      if grep -q '^AUTH_TOKEN=' "$file"; then
+        sed -i "s|^AUTH_TOKEN=.*|AUTH_TOKEN=\"$TOKEN\"|" "$file"
+      else
+        printf 'AUTH_TOKEN="%s"\n' "$TOKEN" >> "$file"
+      fi
+      chmod 600 "$file"
+      info "Saved (file is chmod 600)."
+    fi
+  fi
+}
+
+fetch_models_url() { # GET <url>; prints raw JSON or fails
+  curl -sf --max-time 6 \
+    -H "x-api-key: ${TOKEN:-}" \
+    -H "Authorization: Bearer ${TOKEN:-}" \
+    -H "anthropic-version: 2023-06-01" \
+    "$1" 2>/dev/null
+}
+
+fetch_models() { # /v1/models on BASE_URL, then on its origin; one id per line
+  command -v curl >/dev/null || return 1
+  local base="${BASE_URL%/}" origin resp
+  origin=$(printf '%s' "$base" | grep -oE '^[a-z]+://[^/]+') || origin="$base"
+  if ! resp=$(fetch_models_url "$base/v1/models"); then
+    [ "$origin" != "$base" ] || return 1
+    resp=$(fetch_models_url "$origin/v1/models") || return 1
+  fi
+  local ids
+  if command -v jq >/dev/null; then
+    ids=$(printf '%s' "$resp" | jq -r '.data[].id // empty' 2>/dev/null) || return 1
+  else
+    ids=$(printf '%s' "$resp" \
+      | grep -o '"id"[[:space:]]*:[[:space:]]*"[^"]*"' \
+      | sed 's/.*"\([^"]*\)"$/\1/')
+  fi
+  [ -n "$ids" ] || return 1
+  printf '%s\n' "$ids"
+}
+
+model_list() { # fills MODEL_ITEMS: /v1/models -> MODELS_CMD -> MODELS
+  MODEL_ITEMS=()
+  local src="" m
+  if src=$(fetch_models); then
+    info "Fetched $(printf '%s\n' "$src" | wc -l) models live from /v1/models" >&2
+  elif [ -n "$MODELS_CMD" ] && src=$(bash -c "$MODELS_CMD") && [ -n "$src" ]; then
+    :
+  else
+    src=$(printf '%s\n' $MODELS)
+  fi
+  while IFS= read -r m; do
+    [ -n "$m" ] && MODEL_ITEMS+=("$m")
+  done <<< "$src"
+}
+
+# ----------------------------------------------------------------- launch ---
+
+launch() { # launch <provider> <model> <mode> <ultracode:0|1> [extra claude args...]
+  local provider="$1" model="$2" mode="$3" ultra="$4"; shift 4
+
+  PROVIDER="$provider"
+  load_provider "$provider"
+  [ -n "${TOKEN:-}" ] || resolve_token
+
+  local args=()
+  case "$mode" in
+    auto)    args+=(--permission-mode acceptEdits) ;;
+    bypass)  args+=(--dangerously-skip-permissions) ;;
+    plan)    args+=(--permission-mode plan) ;;
+    default) ;;
+    *) die "unknown mode: $mode (auto|bypass|plan|default)" ;;
+  esac
+
+  # shellcheck disable=SC2086
+  [ -n "$EXTRA_ARGS" ] && args+=($EXTRA_ARGS)
+  args+=("$@")
+  [ "$ultra" = 1 ] && args+=("ultracode")
+
+  printf '%s\n%s\n' "$provider" "$model" > "$LAST_FILE"
+  printf '%s\n%s\n' "$mode" "$ultra" >> "$LAST_FILE"
+
+  export ANTHROPIC_BASE_URL="$BASE_URL"
+  export ANTHROPIC_AUTH_TOKEN="$TOKEN"
+  export ANTHROPIC_MODEL="$model"
+  local fast="${SMALL_FAST_MODEL:-$model}"
+  export ANTHROPIC_SMALL_FAST_MODEL="$fast"
+  export ANTHROPIC_DEFAULT_HAIKU_MODEL="$fast"
+  export API_TIMEOUT_MS="${API_TIMEOUT_MS:-600000}"
+  export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+  unset ANTHROPIC_API_KEY
+
+  if [ -n "$EXTRA_ENV" ]; then
+    local kv
+    for kv in $EXTRA_ENV; do export "${kv?}"; done
+  fi
+
+  info "Launching Claude Code"
+  printf '   %sprovider%s %s\n'   "$DIM" "$RESET" "$NAME"
+  printf '   %sendpoint%s %s\n'   "$DIM" "$RESET" "$BASE_URL"
+  printf '   %smodel%s    %s\n'   "$DIM" "$RESET" "$model"
+  printf '   %sflags%s    %s\n\n' "$DIM" "$RESET" "${args[*]:-"(none)"}"
+
+  command -v claude >/dev/null || die "'claude' not found in PATH"
+  exec claude "${args[@]}"
+}
+
+pick_and_launch() { # pick_and_launch [provider] [model] [extra args...]
+  local provider="${1:-}" model="${2:-}"
+  shift 2
+
+  if [ -z "$provider" ]; then
+    local items=("$ADD_PROVIDER_ITEM") p
+    while IFS= read -r p; do
+      load_provider "$p"
+      items+=("$p — $NAME ($BASE_URL)")
+    done < <(providers)
+    pick "Provider" "${items[@]}" || die "cancelled"
+    if [ "$PICK_CHOICE" = "$ADD_PROVIDER_ITEM" ]; then
+      cmd_add
+      provider="$ADDED_SLUG"
+    else
+      provider="${PICK_CHOICE%% *}"
+    fi
+  fi
+
+  PROVIDER="$provider"
+  load_provider "$provider"
+  resolve_token
+
+  if [ -z "$model" ]; then
+    model_list
+    pick_model
+  fi
+  [ -n "$model" ] || model="$PICK_CHOICE"
+  [ -n "$model" ] || die "no model selected"
+
+  pick "Permission mode" \
+    "auto — auto-accept file edits (--permission-mode acceptEdits)" \
+    "bypass — skip all permission prompts (--dangerously-skip-permissions)" \
+    "plan — plan mode" \
+    "default — normal prompting" || die "cancelled"
+  local mode="${PICK_CHOICE%% *}"
+
+  local ultra=0
+  confirm "Enable ultracode (multi-agent workflows)?" n && ultra=1
+
+  launch "$provider" "$model" "$mode" "$ultra" "$@"
+}
+
+pick_model() { # uses MODEL_ITEMS/DEFAULT_MODEL; sets PICK_CHOICE to a model id
+  if [ "${#MODEL_ITEMS[@]}" -eq 0 ]; then
+    ask PICK_CHOICE "Model id"
+    return
+  fi
+  PICK_PRESELECT="${DEFAULT_MODEL:-}"
+  pick "Model (${#MODEL_ITEMS[@]} available)" "$ADD_MODEL_ITEM" "${MODEL_ITEMS[@]}" \
+    || die "cancelled"
+  if [ "$PICK_CHOICE" = "$ADD_MODEL_ITEM" ]; then
+    ask PICK_CHOICE "Model id"
+    [ -n "$PICK_CHOICE" ] || die "no model selected"
+  fi
+}
+
+# ------------------------------------------------------------ subcommands ---
+
+cmd_list() {
+  local p
+  while IFS= read -r p; do
+    load_provider "$p"
+    printf '%s%-12s%s %s\n' "$BOLD" "$p" "$RESET" "${DIM}$NAME — $BASE_URL${RESET}"
+    printf '             models: %s%s\n' "$MODELS" "${MODELS_CMD:+ (+ live list)}"
+  done < <(providers)
+}
+
+cmd_add() {
+  local slug name url token env_var models default_model fast
+  ask slug "Short name (e.g. openrouter)"
+  [[ "$slug" =~ ^[a-zA-Z0-9_-]+$ ]] || die "name must be alphanumeric/dash/underscore"
+  [ -f "$PROVIDERS_DIR/$slug.conf" ] && die "provider '$slug' already exists (use 'claude-oss edit $slug')"
+  ask name "Display name"
+  ask url "Anthropic-compatible base URL"
+  [ -n "$url" ] || die "base URL is required"
+  ask token "API key ${DIM}(blank = ask at launch, input hidden)${RESET}" secret
+  ask env_var "Env var to read key from ${DIM}(optional, e.g. MY_API_KEY)${RESET}"
+  ask models "Fallback models ${DIM}(space-separated; live list comes from /v1/models)${RESET}"
+  ask default_model "Default model ${DIM}(optional)${RESET}"
+  ask fast "Small/fast model ${DIM}(optional, used for background tasks)${RESET}"
+
+  cat > "$PROVIDERS_DIR/$slug.conf" <<EOF
+NAME="${name:-$slug}"
+BASE_URL="$url"
+AUTH_TOKEN="$token"
+AUTH_TOKEN_ENV="$env_var"
+MODELS="$models"
+DEFAULT_MODEL="$default_model"
+SMALL_FAST_MODEL="$fast"
+EOF
+  chmod 600 "$PROVIDERS_DIR/$slug.conf"
+  ADDED_SLUG="$slug"
+  info "Created provider '$slug'. Launch it with: claude-oss $slug"
+}
+
+cmd_edit() {
+  local p="${1:-}"; [ -n "$p" ] || die "usage: claude-oss edit <provider>"
+  [ -f "$PROVIDERS_DIR/$p.conf" ] || die "no such provider: $p"
+  "${EDITOR:-vi}" "$PROVIDERS_DIR/$p.conf"
+}
+
+cmd_remove() {
+  local p="${1:-}"; [ -n "$p" ] || die "usage: claude-oss remove <provider>"
+  [ -f "$PROVIDERS_DIR/$p.conf" ] || die "no such provider: $p"
+  confirm "Delete provider '$p'?" n || exit 0
+  rm "$PROVIDERS_DIR/$p.conf"
+  info "Removed '$p'."
+}
+
+cmd_last() {
+  [ -f "$LAST_FILE" ] || die "no previous launch recorded"
+  local provider model mode ultra
+  { IFS= read -r provider; IFS= read -r model; IFS= read -r mode; IFS= read -r ultra; } < "$LAST_FILE" || true
+  [ -n "${provider:-}" ] && [ -n "${model:-}" ] || die "last launch file is corrupt"
+  launch "$provider" "$model" "${mode:-default}" "${ultra:-0}" "$@"
+}
+
+usage() {
+  sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+# ------------------------------------------------------------------- main ---
+
+seed_presets
+
+# split off pass-through args after --
+PASS=()
+ARGS=()
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--" ]; then shift; PASS=("$@"); break; fi
+  ARGS+=("$1"); shift
+done
+set -- "${ARGS[@]:+${ARGS[@]}}"
+
+case "${1:-}" in
+  -h|--help|help) usage ;;
+  list|ls)        cmd_list ;;
+  add|new)        cmd_add ;;
+  edit)           shift; cmd_edit "$@" ;;
+  remove|rm)      shift; cmd_remove "$@" ;;
+  last)           shift; cmd_last "${PASS[@]:+${PASS[@]}}" ;;
+  "")             pick_and_launch "" "" "${PASS[@]:+${PASS[@]}}" ;;
+  *)              pick_and_launch "$1" "${2:-}" "${PASS[@]:+${PASS[@]}}" ;;
+esac
