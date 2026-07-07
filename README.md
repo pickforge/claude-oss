@@ -14,8 +14,8 @@ Local-first. Open source. Built for people who ship.
 ## Install
 
 ```bash
-git clone git@github.com:Pickforge/multi-claude.git
-cd multi-claude
+git clone git@github.com:pickforge/claude-oss.git
+cd claude-oss
 ln -sf "$PWD/claude-oss" ~/.local/bin/claude-oss
 ```
 
